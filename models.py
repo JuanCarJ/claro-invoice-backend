@@ -293,6 +293,9 @@ class ChatRequest(BaseModel):
     validation_results: Optional[List[Dict[str, Any]]] = None  # Results of rule validation
     oc_discrepancies: Optional[List[Dict[str, Any]]] = None  # Discrepancies between XML and OC
     invoice_totals: Optional[Dict[str, Any]] = None  # Totals without confidential data
+    # Full data (excluding confidential info - NIT and company names)
+    invoice_data: Optional[Dict[str, Any]] = None  # Full invoice data from XML
+    oc_data: Optional[Dict[str, Any]] = None  # Full OC data from OCR
 
 
 class ChatResponse(BaseModel):

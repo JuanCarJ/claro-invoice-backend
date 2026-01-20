@@ -1152,6 +1152,14 @@ async def chat(request: ChatRequest):
             for key, value in request.invoice_totals.items():
                 invoice_data[key] = value
 
+        # Add full invoice data if provided (already filtered by frontend)
+        if request.invoice_data:
+            invoice_data['_invoice_full'] = request.invoice_data
+
+        # Add full OC data if provided (already filtered by frontend)
+        if request.oc_data:
+            invoice_data['_oc_full'] = request.oc_data
+
         # Get existing rules
         existing_rules = custom_rules_cache.get(request.invoice_id, [])
         logger.info(f"Chat context: invoice_data_keys={list(invoice_data.keys())[:5]}, rules_count={len(existing_rules)}")

@@ -25,27 +25,39 @@ except ImportError:
 
 
 SYSTEM_PROMPT = """Eres un asistente experto en validación de facturas electrónicas colombianas (DIAN).
-Tu rol es ayudar a definir reglas de validación antes de enviar facturas a SAP.
+Tu rol es ayudar con consultas sobre facturas y órdenes de compra, así como definir reglas de validación.
 
 IMPORTANTE: Por confidencialidad, NO tienes acceso a NIT ni nombres de empresas (proveedor/cliente).
 
-Contexto de la factura actual:
+=== DATOS DE LA FACTURA ===
 {invoice_context}
 
-Campos seleccionados por el usuario:
+=== DATOS COMPLETOS DE LA FACTURA (LÍNEAS DE DETALLE) ===
+{invoice_lines}
+
+=== DATOS COMPLETOS DE LA ORDEN DE COMPRA (OCR) ===
+{oc_context}
+
+=== CAMPOS SELECCIONADOS POR EL USUARIO ===
 {selected_fields}
 
-Estado de validación de reglas:
+=== ESTADO DE VALIDACIÓN DE REGLAS ===
 {validation_status}
 
-Discrepancias detectadas (Factura vs Orden de Compra):
+=== DISCREPANCIAS (FACTURA vs OC) ===
 {discrepancies}
 
-Cuando el usuario defina una regla en lenguaje natural, responde con:
-1. Confirmación de la regla entendida en español
-2. JSON estructurado de la regla en un bloque de código
+=== REGLAS CONFIGURADAS ===
+{existing_rules}
 
-Formato de regla:
+INSTRUCCIONES:
+1. Cuando te pregunten sobre datos de la factura o la OC, responde con la información disponible arriba
+2. Puedes responder preguntas sobre líneas de detalle, totales, impuestos, fechas, etc.
+3. Si te piden crear una regla, usa el formato JSON indicado
+4. Si te preguntan por inconsistencias, usa la sección de discrepancias
+5. Siempre responde en español de forma clara y concisa
+
+Formato para definir reglas:
 ```json
 {{
   "id": "CUSTOM_XXX",
@@ -59,41 +71,6 @@ Formato de regla:
   }}
 }}
 ```
-
-Operadores disponibles:
-- ">" : mayor que (para números)
-- "<" : menor que (para números)
-- ">=" : mayor o igual que
-- "<=" : menor o igual que
-- "==" : igual a
-- "!=" : diferente de
-- "contains" : contiene texto
-- "exists" : el campo existe y no está vacío
-
-Campos disponibles del XML (sin datos confidenciales):
-- invoice_number: Número de factura
-- subtotal: Subtotal sin IVA
-- total_con_iva: Total con IVA
-- total_pagable: Total a pagar
-- tax_iva_porcentaje: Porcentaje de IVA
-- tax_iva_valor: Valor del IVA
-- orden_compra: Número de orden de compra
-- issue_date: Fecha de emisión
-- due_date: Fecha de vencimiento
-
-Campos de documentos adjuntos:
-- oc_numero: Número de OC (del PDF)
-- oc_valor_total: Valor total OC
-- cumplimiento_valor_certificado: Valor certificado en cumplimiento
-- mano_obra_total: Total mano de obra
-- fabricantes_total: Total materiales/fabricantes
-
-Reglas ya configuradas:
-{existing_rules}
-
-Si el usuario hace una pregunta sobre los datos de la factura, responde de forma clara y concisa.
-Si el usuario pide explicar por qué una regla falló, explica basándote en los datos de validación proporcionados.
-Siempre responde en español.
 """
 
 
@@ -210,6 +187,98 @@ class OpenAIService:
             lines.append(f"- {field}: Factura={xml_val} vs OC={oc_val}")
 
         return "\n".join(lines)
+
+    def _format_invoice_lines(self, invoice_data: Dict[str, Any]) -> str:
+        """Format full invoice data including lines"""
+        full_invoice = invoice_data.get('_invoice_full', {})
+        if not full_invoice:
+            return "No hay datos de líneas disponibles."
+
+        lines = []
+
+        # Basic invoice info
+        if full_invoice.get('invoice_number'):
+            lines.append(f"Factura: {full_invoice.get('invoice_number')}")
+        if full_invoice.get('cufe'):
+            lines.append(f"CUFE: {full_invoice.get('cufe')}")
+        if full_invoice.get('issue_date'):
+            lines.append(f"Fecha emisión: {full_invoice.get('issue_date')}")
+        if full_invoice.get('due_date'):
+            lines.append(f"Fecha vencimiento: {full_invoice.get('due_date')}")
+        if full_invoice.get('order_reference'):
+            lines.append(f"Orden de Compra: {full_invoice.get('order_reference')}")
+        if full_invoice.get('currency'):
+            lines.append(f"Moneda: {full_invoice.get('currency')}")
+
+        # Monetary totals
+        monetary = full_invoice.get('monetary_total', {})
+        if monetary:
+            lines.append("\nTotales monetarios:")
+            if monetary.get('line_extension_amount'):
+                lines.append(f"  - Subtotal (sin IVA): ${monetary.get('line_extension_amount'):,.0f}")
+            if monetary.get('tax_exclusive_amount'):
+                lines.append(f"  - Total sin impuestos: ${monetary.get('tax_exclusive_amount'):,.0f}")
+            if monetary.get('tax_inclusive_amount'):
+                lines.append(f"  - Total con IVA: ${monetary.get('tax_inclusive_amount'):,.0f}")
+            if monetary.get('payable_amount'):
+                lines.append(f"  - Total a pagar: ${monetary.get('payable_amount'):,.0f}")
+
+        if full_invoice.get('total_iva'):
+            lines.append(f"IVA total: ${full_invoice.get('total_iva'):,.0f}")
+        if full_invoice.get('total_retenciones'):
+            lines.append(f"Retenciones: ${full_invoice.get('total_retenciones'):,.0f}")
+
+        # Invoice lines
+        invoice_lines = full_invoice.get('lines', [])
+        if invoice_lines:
+            lines.append(f"\nLíneas de detalle ({len(invoice_lines)} líneas):")
+            for i, line in enumerate(invoice_lines, 1):
+                desc = line.get('description', 'Sin descripción')[:50]
+                qty = line.get('quantity', 0)
+                unit = line.get('unit_code', '')
+                price = line.get('price_amount', 0)
+                total = line.get('line_amount', 0)
+                lines.append(f"  {i}. {desc} | Cant: {qty} {unit} | Precio: ${price:,.0f} | Total: ${total:,.0f}")
+
+        # Taxes
+        taxes = full_invoice.get('taxes', [])
+        if taxes:
+            lines.append("\nImpuestos:")
+            for tax in taxes:
+                lines.append(f"  - {tax.get('id', 'IVA')} {tax.get('percent', 0)}%: ${tax.get('tax_amount', 0):,.0f}")
+
+        # Withholding taxes
+        wh_taxes = full_invoice.get('withholding_taxes', [])
+        if wh_taxes:
+            lines.append("\nRetenciones:")
+            for tax in wh_taxes:
+                lines.append(f"  - {tax.get('id', 'Ret')} {tax.get('percent', 0)}%: ${tax.get('tax_amount', 0):,.0f}")
+
+        # Notes
+        notes = full_invoice.get('notes', [])
+        if notes:
+            lines.append("\nNotas:")
+            for note in notes[:3]:  # Limit to 3 notes
+                lines.append(f"  - {note[:100]}")
+
+        return "\n".join(lines) if lines else "Sin información de líneas."
+
+    def _format_oc_context(self, invoice_data: Dict[str, Any]) -> str:
+        """Format full OC data from OCR"""
+        oc_full = invoice_data.get('_oc_full', {})
+        if not oc_full:
+            return "No hay datos de Orden de Compra disponibles."
+
+        lines = ["Campos extraídos de la Orden de Compra (OCR):"]
+        for field_name, field_data in oc_full.items():
+            value = field_data.get('value', 'N/A')
+            confidence = field_data.get('confidence', 0) * 100
+            # Format numbers nicely
+            if isinstance(value, (int, float)):
+                value = f"${value:,.0f}" if abs(value) > 100 else value
+            lines.append(f"  - {field_name}: {value} (conf: {confidence:.0f}%)")
+
+        return "\n".join(lines) if len(lines) > 1 else "Sin datos de OC."
 
     def _extract_json_from_response(self, response: str) -> Optional[Dict[str, Any]]:
         """Extract JSON from response text"""
@@ -331,6 +400,42 @@ class OpenAIService:
             else:
                 return ("No tengo información del IVA. ¿Ya seleccionaste una factura?", None)
 
+        # Query about invoice lines/detail
+        if any(word in message_lower for word in ['línea', 'linea', 'detalle', 'producto', 'servicio', 'item', 'items']):
+            full_invoice = invoice_data.get('_invoice_full', {})
+            invoice_lines = full_invoice.get('lines', [])
+            if invoice_lines:
+                lines = [f"**Líneas de detalle de la factura ({len(invoice_lines)} líneas):**\n"]
+                for i, line in enumerate(invoice_lines, 1):
+                    desc = line.get('description', 'Sin descripción')
+                    qty = line.get('quantity', 0)
+                    unit = line.get('unit_code', '')
+                    price = line.get('price_amount', 0)
+                    total = line.get('line_amount', 0)
+                    lines.append(f"{i}. **{desc[:60]}**")
+                    lines.append(f"   Cantidad: {qty} {unit} | Precio: ${price:,.0f} | Total: ${total:,.0f}")
+                return ("\n".join(lines), None)
+            else:
+                return ("No hay información de líneas de detalle disponible.", None)
+
+        # Query about OC data
+        if any(word in message_lower for word in ['orden de compra', 'oc ', 'compra', 'pedido']):
+            oc_full = invoice_data.get('_oc_full', {})
+            if oc_full:
+                lines = ["**Datos de la Orden de Compra (extraídos por OCR):**\n"]
+                for field_name, field_data in oc_full.items():
+                    value = field_data.get('value', 'N/A')
+                    confidence = field_data.get('confidence', 0) * 100
+                    if isinstance(value, (int, float)) and abs(value) > 100:
+                        value = f"${value:,.0f}"
+                    lines.append(f"- **{field_name}:** {value} _(conf: {confidence:.0f}%)_")
+                return ("\n".join(lines), None)
+            else:
+                orden_ref = invoice_data.get('orden_compra')
+                if orden_ref:
+                    return (f"La factura hace referencia a la **Orden de Compra: {orden_ref}**, pero no se ha procesado el documento PDF de la OC.", None)
+                return ("No hay datos de Orden de Compra disponibles. ¿Ya cargaste el documento de OC?", None)
+
         # Query about invoice data/info
         if any(word in message_lower for word in ['datos', 'información', 'info', 'factura', 'número', 'fecha']):
             invoice_number = invoice_data.get('invoice_number')
@@ -338,6 +443,14 @@ class OpenAIService:
             due_date = invoice_data.get('due_date')
             orden_compra = invoice_data.get('orden_compra')
             lines_count = invoice_data.get('lines_count')
+
+            # Also try from full invoice data
+            full_invoice = invoice_data.get('_invoice_full', {})
+            if not invoice_number and full_invoice:
+                invoice_number = full_invoice.get('invoice_number')
+                issue_date = full_invoice.get('issue_date')
+                due_date = full_invoice.get('due_date')
+                orden_compra = full_invoice.get('order_reference')
 
             if invoice_number or issue_date:
                 lines = ["**Información de la factura:**\n"]
@@ -351,6 +464,11 @@ class OpenAIService:
                     lines.append(f"- **Orden de Compra:** {orden_compra}")
                 if lines_count:
                     lines.append(f"- **Líneas de detalle:** {lines_count}")
+
+                # Add CUFE if available
+                if full_invoice.get('cufe'):
+                    lines.append(f"- **CUFE:** {full_invoice.get('cufe')[:30]}...")
+
                 return ("\n".join(lines), None)
             else:
                 return ("No hay datos de factura cargados. Por favor selecciona una factura de la lista o carga un XML.", None)
@@ -474,33 +592,48 @@ Esta regla verificará que el NIT del proveedor sea consistente entre el XML y l
         lines = ["Puedo ayudarte con la siguiente información:\n"]
 
         # Check what data is available
-        has_invoice = bool(invoice_data.get('invoice_number'))
+        has_invoice = bool(invoice_data.get('invoice_number') or invoice_data.get('_invoice_full'))
+        has_invoice_lines = bool(invoice_data.get('_invoice_full', {}).get('lines'))
+        has_oc_data = bool(invoice_data.get('_oc_full'))
         has_validation = bool(invoice_data.get('_validation_results'))
         has_discrepancies = bool(invoice_data.get('_oc_discrepancies'))
 
         if has_invoice:
             lines.append("✅ **Datos de factura** disponibles - pregúntame por totales, fechas, IVA, etc.")
+            if has_invoice_lines:
+                line_count = len(invoice_data.get('_invoice_full', {}).get('lines', []))
+                lines.append(f"   ↳ **{line_count} líneas de detalle** - pregunta 'ver líneas de detalle'")
         else:
             lines.append("⚠️ No hay factura cargada - selecciona una factura primero")
+
+        if has_oc_data:
+            oc_fields = len(invoice_data.get('_oc_full', {}))
+            lines.append(f"✅ **Datos de OC** disponibles ({oc_fields} campos) - pregunta 'ver datos de la OC'")
+        else:
+            lines.append("ℹ️ No hay datos de OC cargados (¿ya procesaste el documento?)")
 
         if has_discrepancies:
             disc_count = len(invoice_data.get('_oc_discrepancies', []))
             lines.append(f"✅ **{disc_count} inconsistencia(s)** detectadas - pregunta '¿qué inconsistencias tiene?'")
+        elif has_oc_data:
+            lines.append("✅ Sin inconsistencias detectadas entre factura y OC")
         else:
-            lines.append("ℹ️ No hay inconsistencias detectadas (¿ya procesaste la OC?)")
+            lines.append("ℹ️ No se ha comparado con OC")
 
         if has_validation:
             val_results = invoice_data.get('_validation_results', [])
             failed = len([r for r in val_results if r.get('status') == 'failed'])
-            lines.append(f"✅ **Validación ejecutada** - {failed} regla(s) fallaron - pregunta '¿qué reglas fallaron?'")
+            passed = len([r for r in val_results if r.get('status') == 'passed'])
+            lines.append(f"✅ **Validación ejecutada** - {passed} OK, {failed} fallaron - pregunta '¿qué reglas fallaron?'")
         else:
             lines.append("ℹ️ No se ha ejecutado validación aún")
 
         lines.append("\n**Ejemplos de preguntas:**")
         lines.append("- '¿Qué inconsistencias tiene esta factura?'")
         lines.append("- '¿Cuáles son los totales?'")
+        lines.append("- 'Ver líneas de detalle'")
+        lines.append("- 'Ver datos de la orden de compra'")
         lines.append("- '¿Qué reglas fallaron?'")
-        lines.append("- 'Crear regla: si el total supera 100M, requiere cumplimiento'")
 
         return ("\n".join(lines), None)
 
@@ -553,6 +686,8 @@ Esta regla verificará que el NIT del proveedor sea consistente entre el XML y l
             # Build system prompt
             system_content = SYSTEM_PROMPT.format(
                 invoice_context=self._format_invoice_context(invoice_data),
+                invoice_lines=self._format_invoice_lines(invoice_data),
+                oc_context=self._format_oc_context(invoice_data),
                 selected_fields=self._format_selected_fields(request.selected_fields),
                 existing_rules=self._format_existing_rules(existing_rules),
                 validation_status=self._format_validation_status(invoice_data),
