@@ -279,9 +279,20 @@ class OpenAIService:
 
         # Query about totals
         if any(word in message_lower for word in ['total', 'monto', 'valor', 'pagar', 'subtotal']):
-            subtotal = invoice_data.get('subtotal', invoice_data.get('line_extension_amount'))
-            total_iva = invoice_data.get('total_iva', invoice_data.get('tax_iva_valor'))
-            total_pagable = invoice_data.get('total_pagable', invoice_data.get('payable_amount'))
+            # Helper to safely convert to float
+            def safe_float(val):
+                if val is None:
+                    return None
+                try:
+                    return float(val)
+                except (ValueError, TypeError):
+                    return None
+
+            subtotal = safe_float(invoice_data.get('subtotal', invoice_data.get('line_extension_amount')))
+            total_iva = safe_float(invoice_data.get('total_iva', invoice_data.get('tax_iva_valor')))
+            total_con_iva = safe_float(invoice_data.get('total_con_iva', invoice_data.get('tax_inclusive_amount')))
+            total_pagable = safe_float(invoice_data.get('total_pagable', invoice_data.get('payable_amount')))
+            total_retenciones = safe_float(invoice_data.get('total_retenciones'))
 
             if subtotal or total_iva or total_pagable:
                 lines = ["**Totales de la factura:**\n"]
@@ -289,6 +300,10 @@ class OpenAIService:
                     lines.append(f"- **Subtotal (sin IVA):** ${subtotal:,.0f} COP")
                 if total_iva:
                     lines.append(f"- **IVA:** ${total_iva:,.0f} COP")
+                if total_con_iva:
+                    lines.append(f"- **Total con IVA:** ${total_con_iva:,.0f} COP")
+                if total_retenciones:
+                    lines.append(f"- **Retenciones:** ${total_retenciones:,.0f} COP")
                 if total_pagable:
                     lines.append(f"- **Total a Pagar:** ${total_pagable:,.0f} COP")
                 return ("\n".join(lines), None)
@@ -297,7 +312,15 @@ class OpenAIService:
 
         # Query about IVA specifically
         if 'iva' in message_lower and ('cuanto' in message_lower or 'cuánto' in message_lower or 'porcentaje' in message_lower):
-            iva_valor = invoice_data.get('total_iva', invoice_data.get('tax_iva_valor'))
+            def safe_float(val):
+                if val is None:
+                    return None
+                try:
+                    return float(val)
+                except (ValueError, TypeError):
+                    return None
+
+            iva_valor = safe_float(invoice_data.get('total_iva', invoice_data.get('tax_iva_valor')))
             iva_pct = invoice_data.get('tax_iva_porcentaje', 19)
             if iva_valor:
                 return (
