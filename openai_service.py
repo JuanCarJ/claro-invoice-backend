@@ -239,15 +239,98 @@ class OpenAIService:
         """Generate mock response for demo"""
         message_lower = message.lower()
 
-        # Query about IVA
-        if 'iva' in message_lower and ('cuanto' in message_lower or 'cuánto' in message_lower or 'valor' in message_lower):
-            iva_valor = invoice_data.get('tax_iva_valor', 5112900)
+        # Query about inconsistencies/discrepancies
+        if any(word in message_lower for word in ['inconsistencia', 'discrepancia', 'diferencia', 'error', 'problema']):
+            discrepancies = invoice_data.get('_oc_discrepancies', [])
+            if discrepancies:
+                lines = ["**Inconsistencias detectadas entre la Factura y la Orden de Compra:**\n"]
+                for disc in discrepancies:
+                    field = disc.get('field_label', disc.get('field_name', 'Campo'))
+                    xml_val = disc.get('xml_value', 'N/A')
+                    oc_val = disc.get('oc_value', 'N/A')
+                    lines.append(f"- **{field}**: Factura = `{xml_val}` vs OC = `{oc_val}`")
+                lines.append(f"\n**Total:** {len(discrepancies)} inconsistencia(s) encontrada(s).")
+                return ("\n".join(lines), None)
+            else:
+                return ("No se han detectado inconsistencias entre la factura y la Orden de Compra. ¿Ya cargaste y procesaste el documento de OC?", None)
+
+        # Query about validation failures
+        if any(word in message_lower for word in ['regla', 'validacion', 'validación', 'fallo', 'falló', 'fallaron', 'pasaron']):
+            validation_results = invoice_data.get('_validation_results', [])
+            if validation_results:
+                passed = [r for r in validation_results if r.get('status') == 'passed']
+                failed = [r for r in validation_results if r.get('status') == 'failed']
+
+                lines = ["**Resultado de la validación de reglas:**\n"]
+
+                if failed:
+                    lines.append(f"**Reglas que FALLARON ({len(failed)}):**")
+                    for r in failed:
+                        lines.append(f"- ❌ **{r.get('rule_name')}**: {r.get('message', 'Sin detalle')}")
+
+                if passed:
+                    lines.append(f"\n**Reglas que PASARON ({len(passed)}):**")
+                    for r in passed:
+                        lines.append(f"- ✅ {r.get('rule_name')}")
+
+                return ("\n".join(lines), None)
+            else:
+                return ("Aún no se ha ejecutado la validación de reglas. Puedes hacerlo en el Paso 3 (Validación y Envío a SAP).", None)
+
+        # Query about totals
+        if any(word in message_lower for word in ['total', 'monto', 'valor', 'pagar', 'subtotal']):
+            subtotal = invoice_data.get('subtotal', invoice_data.get('line_extension_amount'))
+            total_iva = invoice_data.get('total_iva', invoice_data.get('tax_iva_valor'))
+            total_pagable = invoice_data.get('total_pagable', invoice_data.get('payable_amount'))
+
+            if subtotal or total_iva or total_pagable:
+                lines = ["**Totales de la factura:**\n"]
+                if subtotal:
+                    lines.append(f"- **Subtotal (sin IVA):** ${subtotal:,.0f} COP")
+                if total_iva:
+                    lines.append(f"- **IVA:** ${total_iva:,.0f} COP")
+                if total_pagable:
+                    lines.append(f"- **Total a Pagar:** ${total_pagable:,.0f} COP")
+                return ("\n".join(lines), None)
+            else:
+                return ("No tengo información de los totales. ¿Ya seleccionaste una factura?", None)
+
+        # Query about IVA specifically
+        if 'iva' in message_lower and ('cuanto' in message_lower or 'cuánto' in message_lower or 'porcentaje' in message_lower):
+            iva_valor = invoice_data.get('total_iva', invoice_data.get('tax_iva_valor'))
             iva_pct = invoice_data.get('tax_iva_porcentaje', 19)
-            return (
-                f"El IVA de esta factura es de **${iva_valor:,.0f} COP** "
-                f"({iva_pct}% sobre la base gravable).",
-                None
-            )
+            if iva_valor:
+                return (
+                    f"El IVA de esta factura es de **${iva_valor:,.0f} COP** "
+                    f"({iva_pct}% sobre la base gravable).",
+                    None
+                )
+            else:
+                return ("No tengo información del IVA. ¿Ya seleccionaste una factura?", None)
+
+        # Query about invoice data/info
+        if any(word in message_lower for word in ['datos', 'información', 'info', 'factura', 'número', 'fecha']):
+            invoice_number = invoice_data.get('invoice_number')
+            issue_date = invoice_data.get('issue_date')
+            due_date = invoice_data.get('due_date')
+            orden_compra = invoice_data.get('orden_compra')
+            lines_count = invoice_data.get('lines_count')
+
+            if invoice_number or issue_date:
+                lines = ["**Información de la factura:**\n"]
+                if invoice_number:
+                    lines.append(f"- **Número de factura:** {invoice_number}")
+                if issue_date:
+                    lines.append(f"- **Fecha de emisión:** {issue_date}")
+                if due_date:
+                    lines.append(f"- **Fecha de vencimiento:** {due_date}")
+                if orden_compra:
+                    lines.append(f"- **Orden de Compra:** {orden_compra}")
+                if lines_count:
+                    lines.append(f"- **Líneas de detalle:** {lines_count}")
+                return ("\n".join(lines), None)
+            else:
+                return ("No hay datos de factura cargados. Por favor selecciona una factura de la lista o carga un XML.", None)
 
         # Rule about total > 100M
         if '100' in message_lower and ('millon' in message_lower or 'millones' in message_lower):
@@ -364,16 +447,39 @@ Esta regla verificará que el NIT del proveedor sea consistente entre el XML y l
                 None
             )
 
-        # Default response
-        return (
-            "Entendido. ¿Podrías ser más específico sobre qué regla deseas crear? "
-            "Puedo ayudarte a definir validaciones como:\n\n"
-            "- Límites de montos (ej: 'Si el total supera X, requiere aprobación')\n"
-            "- Verificación de campos (ej: 'El IVA debe ser 19%')\n"
-            "- Consistencia entre documentos (ej: 'El NIT debe coincidir en todos los documentos')\n\n"
-            "También puedo responder preguntas sobre los datos de la factura.",
-            None
-        )
+        # Default response - show available data summary
+        lines = ["Puedo ayudarte con la siguiente información:\n"]
+
+        # Check what data is available
+        has_invoice = bool(invoice_data.get('invoice_number'))
+        has_validation = bool(invoice_data.get('_validation_results'))
+        has_discrepancies = bool(invoice_data.get('_oc_discrepancies'))
+
+        if has_invoice:
+            lines.append("✅ **Datos de factura** disponibles - pregúntame por totales, fechas, IVA, etc.")
+        else:
+            lines.append("⚠️ No hay factura cargada - selecciona una factura primero")
+
+        if has_discrepancies:
+            disc_count = len(invoice_data.get('_oc_discrepancies', []))
+            lines.append(f"✅ **{disc_count} inconsistencia(s)** detectadas - pregunta '¿qué inconsistencias tiene?'")
+        else:
+            lines.append("ℹ️ No hay inconsistencias detectadas (¿ya procesaste la OC?)")
+
+        if has_validation:
+            val_results = invoice_data.get('_validation_results', [])
+            failed = len([r for r in val_results if r.get('status') == 'failed'])
+            lines.append(f"✅ **Validación ejecutada** - {failed} regla(s) fallaron - pregunta '¿qué reglas fallaron?'")
+        else:
+            lines.append("ℹ️ No se ha ejecutado validación aún")
+
+        lines.append("\n**Ejemplos de preguntas:**")
+        lines.append("- '¿Qué inconsistencias tiene esta factura?'")
+        lines.append("- '¿Cuáles son los totales?'")
+        lines.append("- '¿Qué reglas fallaron?'")
+        lines.append("- 'Crear regla: si el total supera 100M, requiere cumplimiento'")
+
+        return ("\n".join(lines), None)
 
     def chat(
         self,
