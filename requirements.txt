@@ -1,0 +1,22 @@
+# Azure Functions
+azure-functions>=1.17.0
+
+# FastAPI
+fastapi>=0.109.0
+uvicorn>=0.27.0
+python-multipart>=0.0.6
+
+# Azure Services
+azure-storage-blob>=12.19.0
+azure-ai-documentintelligence>=1.0.0
+openai>=1.12.0
+
+# Data Processing
+pandas>=2.1.0
+openpyxl>=3.1.0
+
+# Pydantic
+pydantic>=2.5.0
+
+# Utilities
+python-dotenv>=1.0.0

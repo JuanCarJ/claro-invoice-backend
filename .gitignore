@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+local.settings.json
+test_cumplimiento.py
+test_doc_intel.py
+test_document_intelligence.py

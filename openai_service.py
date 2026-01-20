@@ -1,0 +1,549 @@
+"""
+Azure OpenAI Service for Rules Chatbot
+Handles natural language rule definition and invoice queries
+"""
+import os
+import json
+import logging
+import re
+from typing import Optional, Dict, Any, List
+
+from models import (
+    ChatMessage, ChatRequest, ChatResponse,
+    ValidationRule, RuleCondition, RuleType
+)
+
+logger = logging.getLogger(__name__)
+
+# Try to import Azure OpenAI
+try:
+    from openai import AzureOpenAI
+    AZURE_OPENAI_AVAILABLE = True
+except ImportError:
+    AZURE_OPENAI_AVAILABLE = False
+    logger.warning("Azure OpenAI SDK not available")
+
+
+SYSTEM_PROMPT = """Eres un asistente experto en validación de facturas electrónicas colombianas (DIAN).
+Tu rol es ayudar a definir reglas de validación antes de enviar facturas a SAP.
+
+IMPORTANTE: Por confidencialidad, NO tienes acceso a NIT ni nombres de empresas (proveedor/cliente).
+
+Contexto de la factura actual:
+{invoice_context}
+
+Campos seleccionados por el usuario:
+{selected_fields}
+
+Estado de validación de reglas:
+{validation_status}
+
+Discrepancias detectadas (Factura vs Orden de Compra):
+{discrepancies}
+
+Cuando el usuario defina una regla en lenguaje natural, responde con:
+1. Confirmación de la regla entendida en español
+2. JSON estructurado de la regla en un bloque de código
+
+Formato de regla:
+```json
+{{
+  "id": "CUSTOM_XXX",
+  "nombre": "Nombre corto descriptivo",
+  "descripcion": "Descripción completa de la regla",
+  "tipo": "blocking" o "warning",
+  "condicion": {{
+    "campo": "nombre_del_campo",
+    "operador": ">" | "<" | "==" | "!=" | "contains" | "exists",
+    "valor": "valor_a_comparar"
+  }}
+}}
+```
+
+Operadores disponibles:
+- ">" : mayor que (para números)
+- "<" : menor que (para números)
+- ">=" : mayor o igual que
+- "<=" : menor o igual que
+- "==" : igual a
+- "!=" : diferente de
+- "contains" : contiene texto
+- "exists" : el campo existe y no está vacío
+
+Campos disponibles del XML (sin datos confidenciales):
+- invoice_number: Número de factura
+- subtotal: Subtotal sin IVA
+- total_con_iva: Total con IVA
+- total_pagable: Total a pagar
+- tax_iva_porcentaje: Porcentaje de IVA
+- tax_iva_valor: Valor del IVA
+- orden_compra: Número de orden de compra
+- issue_date: Fecha de emisión
+- due_date: Fecha de vencimiento
+
+Campos de documentos adjuntos:
+- oc_numero: Número de OC (del PDF)
+- oc_valor_total: Valor total OC
+- cumplimiento_valor_certificado: Valor certificado en cumplimiento
+- mano_obra_total: Total mano de obra
+- fabricantes_total: Total materiales/fabricantes
+
+Reglas ya configuradas:
+{existing_rules}
+
+Si el usuario hace una pregunta sobre los datos de la factura, responde de forma clara y concisa.
+Si el usuario pide explicar por qué una regla falló, explica basándote en los datos de validación proporcionados.
+Siempre responde en español.
+"""
+
+
+class OpenAIService:
+    """Service for Azure OpenAI integration"""
+
+    def __init__(
+        self,
+        endpoint: Optional[str] = None,
+        api_key: Optional[str] = None,
+        deployment: Optional[str] = None,
+        api_version: Optional[str] = None
+    ):
+        """
+        Initialize OpenAI Service
+
+        Args:
+            endpoint: Azure OpenAI endpoint
+            api_key: API key
+            deployment: Deployment name (model)
+            api_version: API version
+        """
+        self.endpoint = endpoint or os.getenv('AZURE_OPENAI_ENDPOINT')
+        self.api_key = api_key or os.getenv('AZURE_OPENAI_KEY')
+        self.deployment = deployment or os.getenv('AZURE_OPENAI_DEPLOYMENT', 'gpt-4o')
+        self.api_version = api_version or os.getenv('AZURE_OPENAI_API_VERSION', '2024-02-15-preview')
+
+        self._mock_mode = False
+
+        if not AZURE_OPENAI_AVAILABLE:
+            logger.warning("Azure OpenAI SDK not installed - using mock mode")
+            self._mock_mode = True
+        elif not self.endpoint or not self.api_key:
+            logger.warning("No Azure OpenAI credentials - using mock mode")
+            self._mock_mode = True
+        else:
+            self._client = AzureOpenAI(
+                azure_endpoint=self.endpoint,
+                api_key=self.api_key,
+                api_version=self.api_version,
+            )
+
+    def _format_invoice_context(self, invoice_data: Dict[str, Any]) -> str:
+        """Format invoice data for context (excluding special keys and confidential data)"""
+        if not invoice_data:
+            return "No hay datos de factura cargados."
+
+        lines = []
+        for key, value in invoice_data.items():
+            # Skip special keys (validation results, discrepancies) - handled separately
+            if key.startswith('_'):
+                continue
+            if value is not None:
+                lines.append(f"- {key}: {value}")
+        return "\n".join(lines) if lines else "Sin datos disponibles."
+
+    def _format_selected_fields(self, fields: List[str]) -> str:
+        """Format selected fields list"""
+        if not fields:
+            return "Ninguno seleccionado"
+        return ", ".join(fields)
+
+    def _format_existing_rules(self, rules: List[ValidationRule]) -> str:
+        """Format existing rules for context"""
+        if not rules:
+            return "Ninguna regla configurada aún."
+
+        lines = []
+        for rule in rules:
+            # Handle both enum and string tipo
+            tipo_str = rule.tipo.value if hasattr(rule.tipo, 'value') else str(rule.tipo)
+            lines.append(f"- {rule.id}: {rule.nombre} ({tipo_str})")
+        return "\n".join(lines)
+
+    def _format_validation_status(self, invoice_data: Dict[str, Any]) -> str:
+        """Format validation results for context"""
+        validation_results = invoice_data.get('_validation_results', [])
+        if not validation_results:
+            return "No se ha ejecutado validación aún."
+
+        passed = []
+        failed = []
+        for result in validation_results:
+            rule_name = result.get('rule_name', 'Regla desconocida')
+            status = result.get('status', 'unknown')
+            message = result.get('message', '')
+
+            if status == 'passed':
+                passed.append(f"- {rule_name}: OK")
+            elif status == 'failed':
+                failed.append(f"- {rule_name}: FALLÓ - {message}")
+
+        lines = []
+        if passed:
+            lines.append("Reglas que PASARON:")
+            lines.extend(passed)
+        if failed:
+            lines.append("\nReglas que FALLARON:")
+            lines.extend(failed)
+
+        return "\n".join(lines) if lines else "Sin resultados de validación."
+
+    def _format_discrepancies(self, invoice_data: Dict[str, Any]) -> str:
+        """Format OC discrepancies for context"""
+        discrepancies = invoice_data.get('_oc_discrepancies', [])
+        if not discrepancies:
+            return "No hay discrepancias detectadas o no se ha comparado con OC."
+
+        lines = ["Discrepancias entre Factura XML y Orden de Compra:"]
+        for disc in discrepancies:
+            field = disc.get('field_label', disc.get('field_name', 'Campo'))
+            xml_val = disc.get('xml_value', 'N/A')
+            oc_val = disc.get('oc_value', 'N/A')
+            lines.append(f"- {field}: Factura={xml_val} vs OC={oc_val}")
+
+        return "\n".join(lines)
+
+    def _extract_json_from_response(self, response: str) -> Optional[Dict[str, Any]]:
+        """Extract JSON from response text"""
+        # Try to find JSON in code block
+        json_match = re.search(r'```json\s*([\s\S]*?)\s*```', response)
+        if json_match:
+            try:
+                return json.loads(json_match.group(1))
+            except json.JSONDecodeError:
+                pass
+
+        # Try to find JSON without code block
+        json_match = re.search(r'\{[\s\S]*"id"[\s\S]*"condicion"[\s\S]*\}', response)
+        if json_match:
+            try:
+                return json.loads(json_match.group(0))
+            except json.JSONDecodeError:
+                pass
+
+        return None
+
+    def _mock_chat_response(
+        self,
+        message: str,
+        invoice_data: Dict[str, Any]
+    ) -> tuple[str, Optional[ValidationRule]]:
+        """Generate mock response for demo"""
+        message_lower = message.lower()
+
+        # Query about IVA
+        if 'iva' in message_lower and ('cuanto' in message_lower or 'cuánto' in message_lower or 'valor' in message_lower):
+            iva_valor = invoice_data.get('tax_iva_valor', 5112900)
+            iva_pct = invoice_data.get('tax_iva_porcentaje', 19)
+            return (
+                f"El IVA de esta factura es de **${iva_valor:,.0f} COP** "
+                f"({iva_pct}% sobre la base gravable).",
+                None
+            )
+
+        # Rule about total > 100M
+        if '100' in message_lower and ('millon' in message_lower or 'millones' in message_lower):
+            rule = ValidationRule(
+                id="CUSTOM_001",
+                nombre="Cumplimiento para facturas >100M",
+                descripcion="Si la factura supera 100 millones, requiere formato de cumplimiento",
+                tipo=RuleType.BLOCKING,
+                fuentes=["xml", "formato_cumplimiento"],
+                condicion=RuleCondition(
+                    campo="total_pagable",
+                    operador=">",
+                    valor=100000000
+                ),
+                is_custom=True
+            )
+            response = """Entendido. He creado una regla de validación:
+
+**Regla:** Si el total de la factura supera 100 millones COP, debe existir un formato de cumplimiento adjunto.
+
+```json
+{
+  "id": "CUSTOM_001",
+  "nombre": "Cumplimiento para facturas >100M",
+  "descripcion": "Si la factura supera 100 millones, requiere formato de cumplimiento",
+  "tipo": "blocking",
+  "condicion": {
+    "campo": "total_pagable",
+    "operador": ">",
+    "valor": 100000000
+  }
+}
+```
+
+Esta regla es **bloqueante**, lo que significa que la factura no podrá enviarse a SAP si no cumple esta condición."""
+            return response, rule
+
+        # Rule about IVA percentage
+        if 'verifica' in message_lower and 'iva' in message_lower:
+            rule = ValidationRule(
+                id="CUSTOM_002",
+                nombre="IVA estándar 19%",
+                descripcion="El porcentaje de IVA debe ser 19%",
+                tipo=RuleType.WARNING,
+                fuentes=["xml"],
+                condicion=RuleCondition(
+                    campo="tax_iva_porcentaje",
+                    operador="==",
+                    valor=19.0
+                ),
+                is_custom=True
+            )
+            response = """He creado una regla para verificar el IVA:
+
+```json
+{
+  "id": "CUSTOM_002",
+  "nombre": "IVA estándar 19%",
+  "descripcion": "El porcentaje de IVA debe ser 19%",
+  "tipo": "warning",
+  "condicion": {
+    "campo": "tax_iva_porcentaje",
+    "operador": "==",
+    "valor": 19.0
+  }
+}
+```
+
+Esta regla generará una **advertencia** si el IVA no es 19%."""
+            return response, rule
+
+        # NIT validation rule
+        if 'nit' in message_lower and ('coinc' in message_lower or 'verif' in message_lower):
+            rule = ValidationRule(
+                id="CUSTOM_003",
+                nombre="NIT proveedor consistente",
+                descripcion="El NIT del proveedor debe coincidir en XML y documentos adjuntos",
+                tipo=RuleType.BLOCKING,
+                fuentes=["xml", "orden_compra"],
+                condicion=RuleCondition(
+                    campo="supplier_nit",
+                    operador="==",
+                    valor="oc_proveedor_nit"
+                ),
+                is_custom=True
+            )
+            response = """He creado una regla para validar consistencia del NIT:
+
+```json
+{
+  "id": "CUSTOM_003",
+  "nombre": "NIT proveedor consistente",
+  "descripcion": "El NIT del proveedor debe coincidir en XML y documentos adjuntos",
+  "tipo": "blocking",
+  "condicion": {
+    "campo": "supplier_nit",
+    "operador": "==",
+    "valor": "oc_proveedor_nit"
+  }
+}
+```
+
+Esta regla verificará que el NIT del proveedor sea consistente entre el XML y la Orden de Compra."""
+            return response, rule
+
+        # Explain rule failure
+        if 'por qué' in message_lower or 'porque' in message_lower or 'falló' in message_lower:
+            return (
+                "La regla pudo fallar por las siguientes razones:\n\n"
+                "1. **Datos incompletos**: Algún campo requerido no está presente\n"
+                "2. **Valores no coincidentes**: Los valores entre documentos no concuerdan\n"
+                "3. **Umbrales excedidos**: El valor supera los límites configurados\n\n"
+                "Por favor, verifica los datos específicos en la vista de validación.",
+                None
+            )
+
+        # Default response
+        return (
+            "Entendido. ¿Podrías ser más específico sobre qué regla deseas crear? "
+            "Puedo ayudarte a definir validaciones como:\n\n"
+            "- Límites de montos (ej: 'Si el total supera X, requiere aprobación')\n"
+            "- Verificación de campos (ej: 'El IVA debe ser 19%')\n"
+            "- Consistencia entre documentos (ej: 'El NIT debe coincidir en todos los documentos')\n\n"
+            "También puedo responder preguntas sobre los datos de la factura.",
+            None
+        )
+
+    def chat(
+        self,
+        request: ChatRequest,
+        invoice_data: Optional[Dict[str, Any]] = None,
+        existing_rules: Optional[List[ValidationRule]] = None
+    ) -> ChatResponse:
+        """
+        Process chat message and return response
+
+        Args:
+            request: Chat request with message and context
+            invoice_data: Current invoice data for context
+            existing_rules: Already configured rules
+
+        Returns:
+            ChatResponse with response text and optional rule
+        """
+        invoice_data = invoice_data or {}
+        existing_rules = existing_rules or []
+
+        logger.info(f"OpenAI chat called: mock_mode={self._mock_mode}, message_length={len(request.message)}")
+
+        if self._mock_mode:
+            try:
+                response_text, rule = self._mock_chat_response(request.message, invoice_data)
+
+                # Build conversation history - ensure all items are ChatMessage objects
+                history = []
+                for msg in request.conversation_history:
+                    if isinstance(msg, dict):
+                        history.append(ChatMessage(**msg))
+                    else:
+                        history.append(msg)
+                history.append(ChatMessage(role="user", content=request.message))
+                history.append(ChatMessage(role="assistant", content=response_text))
+
+                return ChatResponse(
+                    response=response_text,
+                    rule=rule,
+                    conversation_history=history,
+                )
+            except Exception as e:
+                logger.error(f"Error in mock chat response: {e}", exc_info=True)
+                raise
+
+        try:
+            # Build system prompt
+            system_content = SYSTEM_PROMPT.format(
+                invoice_context=self._format_invoice_context(invoice_data),
+                selected_fields=self._format_selected_fields(request.selected_fields),
+                existing_rules=self._format_existing_rules(existing_rules),
+                validation_status=self._format_validation_status(invoice_data),
+                discrepancies=self._format_discrepancies(invoice_data),
+            )
+
+            # Build messages
+            messages = [{"role": "system", "content": system_content}]
+
+            # Add conversation history
+            for msg in request.conversation_history:
+                if isinstance(msg, dict):
+                    messages.append({
+                        "role": msg.get("role", "user"),
+                        "content": msg.get("content", ""),
+                    })
+                else:
+                    messages.append({
+                        "role": msg.role,
+                        "content": msg.content,
+                    })
+
+            # Add current message
+            messages.append({
+                "role": "user",
+                "content": request.message,
+            })
+
+            logger.info(f"Calling Azure OpenAI: deployment={self.deployment}, messages_count={len(messages)}")
+
+            # Call Azure OpenAI
+            response = self._client.chat.completions.create(
+                model=self.deployment,
+                messages=messages,
+                temperature=0.7,
+                max_tokens=1000,
+            )
+
+            response_text = response.choices[0].message.content
+            logger.info(f"Azure OpenAI response received: length={len(response_text)}")
+
+            # Try to extract rule from response
+            rule = None
+            rule_json = self._extract_json_from_response(response_text)
+            if rule_json:
+                try:
+                    # Convert JSON to ValidationRule
+                    condicion = None
+                    if "condicion" in rule_json:
+                        cond = rule_json["condicion"]
+                        if isinstance(cond, dict) and "campo" in cond:
+                            condicion = RuleCondition(
+                                campo=cond["campo"],
+                                operador=cond.get("operador", "=="),
+                                valor=cond.get("valor"),
+                            )
+
+                    rule = ValidationRule(
+                        id=rule_json.get("id", f"CUSTOM_{len(existing_rules)+1:03d}"),
+                        nombre=rule_json.get("nombre", "Regla personalizada"),
+                        descripcion=rule_json.get("descripcion", ""),
+                        tipo=RuleType(rule_json.get("tipo", "warning")),
+                        fuentes=rule_json.get("fuentes", ["xml"]),
+                        condicion=condicion,
+                        is_custom=True,
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to parse rule from response: {e}")
+
+            # Build conversation history - ensure all items are ChatMessage objects
+            history = []
+            for msg in request.conversation_history:
+                if isinstance(msg, dict):
+                    history.append(ChatMessage(**msg))
+                else:
+                    history.append(msg)
+            history.append(ChatMessage(role="user", content=request.message))
+            history.append(ChatMessage(role="assistant", content=response_text))
+
+            return ChatResponse(
+                response=response_text,
+                rule=rule,
+                conversation_history=history,
+            )
+
+        except Exception as e:
+            logger.error(f"Error in Azure OpenAI chat completion: {e}", exc_info=True)
+            logger.warning("Falling back to mock mode due to Azure OpenAI error")
+
+            # Fallback to mock mode
+            try:
+                response_text, rule = self._mock_chat_response(request.message, invoice_data)
+
+                # Build conversation history
+                history = []
+                for msg in request.conversation_history:
+                    if isinstance(msg, dict):
+                        history.append(ChatMessage(**msg))
+                    else:
+                        history.append(msg)
+                history.append(ChatMessage(role="user", content=request.message))
+                history.append(ChatMessage(role="assistant", content=response_text))
+
+                return ChatResponse(
+                    response=response_text,
+                    rule=rule,
+                    conversation_history=history,
+                )
+            except Exception as fallback_error:
+                logger.error(f"Fallback mock mode also failed: {fallback_error}", exc_info=True)
+                raise
+
+
+# Singleton instance
+_openai_service: Optional[OpenAIService] = None
+
+
+def get_openai_service() -> OpenAIService:
+    """Get or create OpenAIService singleton"""
+    global _openai_service
+    if _openai_service is None:
+        _openai_service = OpenAIService()
+    return _openai_service
